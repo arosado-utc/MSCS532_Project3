@@ -3,9 +3,12 @@ MSCS 532 - Project (Phase 1)
 EmuCache: toy guest machine and block decoder.
 
 A tiny register machine with a 3-byte instruction format
-[op, a, b]. Memory is 256 bytes: addresses 0x00-0x3F hold code
-and 0x40-0xFF hold data. Registers are 16 bits; LOAD/STORE move
-a single byte between memory and a register (truncating on the
+[op, a, b]. Memory is 256 bytes. By default addresses 0x00-0x3F
+hold code and 0x40-0xFF hold data; the split is a parameter, so
+a workload that needs more room for code can widen the code
+region (the Phase 3 stress workloads use code_end = 0x80 with
+data at 0x90 and up). Registers are 16 bits; LOAD/STORE move a
+single byte between memory and a register (truncating on the
 way in, masking on the way out), while ADD/SUB work on the full
 16-bit register.
 
@@ -33,8 +36,11 @@ CODE_END = 0x40  # first data address; code lives in [0, CODE_END)
 class Guest:
     """Toy guest machine: 8 sixteen-bit registers, 256-byte memory."""
 
-    def __init__(self, code):
-        """code: iterable of (address, byte) pairs for the program."""
+    def __init__(self, code, code_end=CODE_END):
+        """code: iterable of (address, byte) pairs for the program.
+        code_end: first data address; code lives in [0, code_end).
+        Defaults to CODE_END, the Phase 1/2 split."""
+        self.code_end = code_end
         self.mem = [0] * 256
         for addr, byte in code:
             if addr >= len(self.mem):

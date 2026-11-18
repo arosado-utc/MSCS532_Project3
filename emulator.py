@@ -11,6 +11,12 @@ to its own code (self-modifying code).
 The statistics counters are what make the data structures
 observable: hits/misses show cache effectiveness, evictions show
 capacity pressure, and invalidations show the SMC cost.
+
+Phase 3 makes the cache and the watcher pluggable: the
+constructor takes optional cache and watcher objects, so the
+history-based cache and the interval-granularity watcher can be
+dropped in behind the same dispatch loop. The SMC check uses
+the guest's own code_end, so a widened code region is honored.
 """
 
 from cache import LRUCache
@@ -39,10 +45,14 @@ class Block:
 class Emulator:
     """Dynamic recompiler over the toy guest machine."""
 
-    def __init__(self, guest, cache_capacity=8):
+    def __init__(self, guest, cache_capacity=8, cache=None, watcher=None):
         self.guest = guest
-        self.cache = LRUCache(cache_capacity)
-        self.watcher = PageWatcher(page_size=32)
+        if cache is None:
+            cache = LRUCache(cache_capacity)
+        self.cache = cache
+        if watcher is None:
+            watcher = PageWatcher(page_size=32)
+        self.watcher = watcher
         self.stats = {"hits": 0, "misses": 0,
                       "evictions": 0, "invalidations": 0}
         self._next_block_id = 0
@@ -90,7 +100,7 @@ class Emulator:
         blocks are evicted before the new bytes are read by any
         future translation."""
         self.guest.mem[addr] = value % 256
-        if addr < CODE_END:
+        if addr < self.guest.code_end:
             for block_id in self.watcher.on_write(addr):
                 block = self._by_id.get(block_id)
                 if block is not None:
