@@ -1,0 +1,9 @@
+cycles,watcher,fetches,hits,misses,evictions,invalidations,hit_rate_pct,wall_ms
+3,page,124,114,10,0,5,91.94,0.112
+3,interval,124,116,8,0,2,93.55,0.094
+5,page,206,192,14,0,9,93.2,0.166
+5,interval,206,196,10,0,4,95.15,0.139
+10,page,411,387,24,0,19,94.16,0.398
+10,interval,411,396,15,0,9,96.35,0.322
+20,page,821,777,44,0,39,94.64,0.757
+20,interval,821,796,25,0,19,96.95,0.637

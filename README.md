@@ -17,6 +17,10 @@ structures that make that caching work.
 | `emulator.py`| the recompiler core tying the pieces together    | - |
 | `workloads.py` | parameterized guest workloads (Phase 2)         | - |
 | `benchmark.py` | cache-size and input-mix sweeps (Phase 2)      | - |
+| `history.py`   | `HistoryCache` - 2Q-style quarantine + LRU main region (Phase 3) | O(n) |
+| `interval.py`  | `IntervalWatcher` - exact [start, end) ranges, bisect (Phase 3) | O(log n + w) per write |
+| `stress.py`    | Phase 3 stress workloads                        | - |
+| `benchmark3.py` | Phase 3 sweeps against the Phase 1/2 baselines | - |
 
 Why these choices:
 
@@ -101,27 +105,102 @@ Run it:
 python3 benchmark.py
 ```
 
+## Phase 3: the trade-off study
+
+Phase 3 pushes on the two spots where Phases 1 and 2 made
+deliberate simplifications, the eviction policy and the SMC
+granularity. Each new structure drops in behind the same
+dispatch loop (the emulator constructor now takes an optional
+cache and watcher) and is measured against the Phase 1/2
+baseline on workloads built to expose it.
+
+Two design notes:
+
+- **HistoryCache** is the 2Q structure of Johnson and Shasha
+  (1994) without the ghost queue. New blocks land in a FIFO
+  quarantine (AIN, half the capacity) and a second reference
+  promotes them to the LRU-ordered main region (AMR, the other
+  half). Eviction takes the AIN head first, so a one-shot scan
+  displaces other scan blocks before it can reach the resident
+  core. The split is 50/50 rather than 2Q's 25/75 because the
+  hot cores here are four to six blocks and a quarter-sized
+  quarantine thrashes them.
+- **IntervalWatcher** registers each block's exact half-open
+  range and returns exactly the blocks a write touches. No
+  collateral evictions, at the cost of an O(n) scan instead of
+  the page watcher's O(1) lookup - a fine trade at a dozen
+  cached blocks, and the invalidation count is the number of
+  blocks the write actually hit.
+
+The stress workloads in `stress.py` widen the code region to
+[0x00, 0x80) (data moves to 0x90 and up) so a program can hold
+a hot core plus a long tail of one-shot blocks:
+
+| Workload                        | Access pattern                    | What it exposes |
+| ------------------------------- | --------------------------------- | --------------- |
+| `mixed_scan(rounds, stubs, levels)` | a four-block hot core interleaved with one-shot stub chains | scan resistance |
+| `level_chain(levels)`           | the same builder, variable levels | linear scaling in the fetch count |
+| `patch_storm(cycles, reps)`     | one loop, three SMC writes per phase | page vs interval invalidation cost |
+
+`benchmark3.py` writes CSVs to `results3/` and plots to
+`plots3/`. The sweep at C = 8 is the headline:
+
+- **Capacity sweep** - on the mixed scan, LRU is flat at 37.86%
+  from C = 4 to 16 and only reaches 77.67% at C = 24, when the
+  cache finally holds all 23 distinct blocks. The history cache
+  is at 0% below C = 8 (the four-block core will not fit in a
+  three-slot AMR) and then holds 45.63% at every larger
+  capacity. History wins the middle range where LRU keeps
+  paying for scans and loses at C = 24, where plain LRU simply
+  fits everything. That crossover is the honest read of the
+  sweep.
+- **Level chain** - fetches grow by 34 per level (one core
+  round plus one scan), the same slope for both caches, and
+  wall time scales with it.
+- **Patch storm** - invalidations vs patch frequency. The
+  interval watcher pays exactly one block per patch burst, the
+  loop body, for a total of cycles - 1. The page watcher also
+  kills the loopback block that shares page 0, and the hot
+  loopback re-misses after every burst, for a total of
+  3 + 2*(cycles - 2). At 20 cycles the interval watcher
+  invalidates 19 blocks and misses 25 times where the page
+  watcher invalidates 39 and misses 44.
+
+Run it:
+
+```bash
+python3 benchmark3.py
+```
+
 ## Tests
 
 ```bash
 python3 tests.py
 ```
 
-29 tests cover the hash table (probing, tombstones, rehashing,
+40 tests cover the hash table (probing, tombstones, rehashing,
 key spread), the LRU cache (eviction order, refresh, removal),
 the page watcher (registration, spanning pages, unwatched
 pages), the decoder, end-to-end runs of the Phase 1 programs
-checked against a naive single-step reference interpreter, and
-the Phase 2 workloads: reference-interpreter agreement, the
+checked against a naive single-step reference interpreter, the
+Phase 2 workloads (reference-interpreter agreement, the
 hand-counted block/eviction/invalidation totals, builder
-validation, and the monotonicity of the hit rate in the cache
-capacity.
+validation, the monotonicity of the hit rate in the cache
+capacity), and the Phase 3 structures: the interval watcher's
+exact ranges and unregistration, the history cache's promotion
+and AIN-first eviction, the stress workloads against the
+reference interpreter, and the measured hit-rate and
+invalidation totals from benchmark3.py pinned by hand.
 
 ## References
 
 - Bellard, F. (2005). QEMU, a fast and portable dynamic
   translator. *Proceedings of the USENIX Annual Technical
   Conference (FREENIX Track)*, 41-46.
+- Johnson, T., & Shasha, D. (1994). 2Q: A low overhead high
+  performance buffer management replacement algorithm.
+  *Proceedings of the 20th International Conference on Very
+  Large Data Bases (VLDB '94)*, 439-450. Morgan Kaufmann.
 - Pagh, R., & Rodler, F. F. (2002). Cuckoo hashing. In
   *Proceedings of the 9th European Symposium on Algorithms
   (ESA 2001)* (Lecture Notes in Computer Science, Vol. 2161,
