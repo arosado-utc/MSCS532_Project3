@@ -1,5 +1,5 @@
 """
-MSCS 532 - Project (Phases 1 + 2)
+MSCS 532 - Project (Phases 1 + 2 + 3)
 EmuCache test suite.
 
 Run with:  python3 tests.py
@@ -12,16 +12,22 @@ reference path fails the suite. Phase 2 adds the parameterized
 workloads from workloads.py and the benchmark harness from
 benchmark.py: every workload is checked against the reference
 interpreter, and the expected block counts, eviction counts, and
-invalidation counts are asserted by hand.
+invalidation counts are asserted by hand. Phase 3 adds the
+history-based cache, the interval watcher, and the stress
+workloads: the measured hit-rate and invalidation numbers from
+benchmark3.py are pinned here by hand.
 """
 
 from benchmark import run_case
 from cache import HashTable, LRUCache
 from emulator import Emulator
-from guest import (Guest, OP_ADD, OP_HALT, OP_JMP, OP_JZ, OP_LOAD,
-                   OP_STORE, OP_SUB)
+from guest import (CODE_END, Guest, OP_ADD, OP_HALT, OP_JMP, OP_JZ,
+                   OP_LOAD, OP_STORE, OP_SUB)
+from history import HistoryCache
+from interval import IntervalWatcher
 from main import program_counter, program_self_patching
 from smc import PageWatcher
+from stress import level_chain, mixed_scan, patch_storm
 from workloads import counter, hub_game, multi_phase_game, patch_game
 
 
@@ -367,6 +373,173 @@ def test_run_case_row_is_consistent():
     assert row["hit_rate_pct"] == round(
         100.0 * row["hits"] / row["fetches"], 2)
     assert 0.0 <= row["hit_rate_pct"] <= 100.0
+
+
+# Phase 3: interval watcher
+def test_interval_exact_and_overlap():
+    """A write returns exactly the ranges that contain it: the
+    half-open edge excludes the range that ends there, and a
+    write in the gap between ranges invalidates nothing."""
+    w = IntervalWatcher()
+    w.register(1, 0x00, 0x10)
+    w.register(2, 0x10, 0x20)
+    w.register(3, 0x08, 0x18)   # overlaps both of the above
+    assert w.on_write(0x05) == {1}
+    assert w.on_write(0x0A) == {1, 3}
+    assert w.on_write(0x10) == {2, 3}   # 1 ends at 0x10, excluded
+    assert w.on_write(0x18) == {2}      # 3 ends at 0x18, excluded
+    assert w.on_write(0x20) == set()
+    assert w.on_write(0x30) == set()    # gap: no range covers it
+
+
+def test_interval_unregister():
+    w = IntervalWatcher()
+    w.register(1, 0x00, 0x10)
+    w.register(3, 0x08, 0x18)
+    w.unregister(3, 0x08, 0x18)
+    assert w.on_write(0x09) == {1}      # only 1 remains over 0x09
+    assert w.on_write(0x15) == set()    # nothing covers 0x15 now
+    # dropping a range that was never registered is a silent no-op
+    w.unregister(9, 0x40, 0x50)
+    assert w.on_write(0x44) == set()
+
+
+def test_interval_no_collateral():
+    """The case the page watcher gets wrong: two blocks on the
+    same page, and a write to one byte kills only the block that
+    covers that byte."""
+    w = IntervalWatcher()
+    w.register(1, 0x00, 0x08)
+    w.register(2, 0x08, 0x10)
+    assert w.on_write(0x03) == {1}
+    assert w.on_write(0x0B) == {2}
+
+
+# Phase 3: history cache
+def test_history_promotion_and_ain_first_eviction():
+    """A hit in AIN promotes the entry to AMR, and eviction takes
+    the AIN head before it touches the AMR - even when the AIN
+    entry is the newest one in the cache."""
+    c = HistoryCache(4)   # AIN holds at most 2
+    c.put(1, "a")
+    c.put(2, "b")
+    assert c.get(1) == "a"      # 1 promoted: AIN [2], AMR [1]
+    c.put(3, "c")               # AIN [2, 3]
+    ev = c.put(4, "d")          # AIN would reach 3, over quota
+    assert ev == (2, "b")       # the AIN head goes, not the AMR
+    assert c.get(2) is None
+    assert c.get(3) == "c"      # promote 3
+    assert c.get(4) == "d"      # promote 4; AIN is now empty
+    c.put(5, "e")               # AIN [5], cache is full
+    ev = c.put(6, "f")          # AIN still non-empty
+    assert ev == (5, "e")       # AIN head beats the AMR tail
+
+
+def test_history_remove_and_interface():
+    """remove() drops an entry without counting it as an
+    eviction, and the get / put / remove / evictions surface
+    matches LRUCache."""
+    c = HistoryCache(4)
+    c.put(1, "a")
+    c.put(2, "b")
+    assert len(c) == 2
+    assert c.remove(1) == "a"
+    assert c.get(1) is None
+    assert c.remove(1) is None
+    assert c.evictions == 0
+    lru = LRUCache(4)
+    lru.put(1, "a")
+    assert lru.remove(1) == "a"
+    assert lru.remove(1) is None
+
+
+def test_history_capacity_validation():
+    try:
+        HistoryCache(1)   # needs at least one slot per segment
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+
+
+# Phase 3: stress workloads
+def test_guest_code_end_default_and_wide():
+    """The Phase 1/2 split is the default; the stress workloads
+    widen it, and the emulator honors whatever the guest says."""
+    assert program_counter().code_end == CODE_END
+    assert mixed_scan().code_end == 0x80
+    assert patch_storm(3, 20).code_end == 0x48
+
+
+def test_stress_workloads_match_reference():
+    """Every stress workload must produce the same register file
+    as the naive interpreter, and the expected final score."""
+    cases = [
+        (lambda: mixed_scan(), 72),
+        (lambda: mixed_scan(levels=2), 48),
+        (lambda: mixed_scan(rounds=2, stubs=8, levels=4), 48),
+        (lambda: level_chain(4), 96),
+        (lambda: patch_storm(1, 20), 20),
+        (lambda: patch_storm(2, 20), 120),
+        (lambda: patch_storm(5, 20), 780),
+    ]
+    for builder, score in cases:
+        expected = naive_run(builder())
+        actual = Emulator(builder(), cache_capacity=8).run()
+        assert actual == expected
+        assert actual[0] == score
+
+
+def test_mixed_scan_history_beats_lru():
+    """The stub scans push the hot core out of the LRU cache;
+    the history cache quarantines first references and keeps the
+    core resident, so it misses 56 times where LRU misses 64.
+    No store in the workload touches the code region, so both
+    runs have zero invalidations."""
+    lru = Emulator(mixed_scan(), cache=LRUCache(8))
+    lru.run()
+    hist = Emulator(mixed_scan(), cache=HistoryCache(8))
+    hist.run()
+    assert lru.stats["misses"] == 64
+    assert hist.stats["misses"] == 56
+    assert lru.stats["invalidations"] == 0
+    assert hist.stats["invalidations"] == 0
+
+
+def test_level_chain_fetches_scale_linearly():
+    """Each level adds one core round and one scan, so fetches
+    grow by 4*rounds + stubs + 3 = 34 per level at the default
+    parameters, and the total matches the builder's formula."""
+    prev = None
+    for lv in (2, 3, 4, 5, 6):
+        emu = Emulator(level_chain(lv), cache_capacity=8)
+        emu.run()
+        f = emu.stats["hits"] + emu.stats["misses"]
+        if prev is not None:
+            assert f - prev == 34, (lv, f, prev)
+        prev = f
+    assert prev == 1 + 6 * (4 * 4 + 15 + 3)
+
+
+def test_patch_storm_interval_beats_page():
+    """Each phase re-applies the patch three times, but only the
+    first write of a burst finds the affected blocks still
+    registered (the drop unregisters them). The interval watcher
+    pays one block per burst, the loop body, while the page
+    watcher also kills the loopback block that shares page 0 and
+    re-misses it. With cycles >= 2: interval = cycles - 1,
+    page = 3 + 2*(cycles - 2)."""
+    for cycles in (3, 5, 10, 20):
+        page = Emulator(patch_storm(cycles, 20), cache=LRUCache(8),
+                        watcher=PageWatcher(page_size=32))
+        page.run()
+        interval = Emulator(patch_storm(cycles, 20), cache=LRUCache(8),
+                            watcher=IntervalWatcher())
+        interval.run()
+        assert interval.stats["invalidations"] == cycles - 1
+        assert page.stats["invalidations"] == 3 + 2 * (cycles - 2)
+        assert interval.stats["misses"] < page.stats["misses"]
+
+
 def main():
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
